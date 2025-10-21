@@ -5,27 +5,26 @@ from telegram import Bot
 from telegram.constants import ParseMode
 from dotenv import load_dotenv
 from dateutil import parser
+from database import db
 
-# Carrega variáveis de ambiente (.env)
+# Carrega variáveis de ambiente
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROUP_ID = int(os.getenv("GROUP_ID"))
-
-# Para exibição no título da enquete (GMT-3)
 TIMEZONE_OFFSET = -3
 
-# Carrega o calendário local da temporada (datas em UTC)
-with open("calendario_nba_2025.json", "r", encoding="utf-8") as f:
-    calendario = json.load(f)
-
-def jogos_de_hoje():
-    hoje_utc = datetime.utcnow().date()
-    return [j for j in calendario if j["data"] == hoje_utc.strftime("%Y-%m-%d")]
-
 async def postar_apostas_e_enquetes():
-    bot = Bot(BOT_TOKEN)
-    jogos = jogos_de_hoje()
+    # Verificar se já executou hoje
+    if db.execucao_hoje_feita():
+        print("Enquetes de hoje já foram criadas.")
+        return
 
+    bot = Bot(BOT_TOKEN)
+    
+    # Obter data atual no Brasil
+    hoje_brasil = datetime.now().strftime('%Y-%m-%d')
+    jogos = db.obter_jogos_do_dia(hoje_brasil)
+    
     if not jogos:
         print("Nenhum jogo encontrado para hoje.")
         return
@@ -38,45 +37,51 @@ async def postar_apostas_e_enquetes():
     )
     await bot.pin_chat_message(chat_id=GROUP_ID, message_id=msg.message_id)
 
-    for jogo in jogos:
-        mandante = jogo["mandante"]
-        visitante = jogo["visitante"]
-        canal = jogo["canal"]
+    enquetes_info = []
 
-        # Parse do horário UTC e força timezone explícito
-        hora_utc = parser.isoparse(jogo["hora_utc"]).replace(tzinfo=timezone.utc)
+    for jogo in jogos:
+        # jogo[3] = mandante, jogo[4] = visitante, jogo[6] = canal_brasil
+        mandante = jogo[3]
+        visitante = jogo[4]
+        canal = jogo[6] or "TBD"  # Usa canal Brasil se disponível
+
+        # Converter horário UTC para local
+        hora_utc = parser.isoparse(f"{jogo[1]}T{jogo[2]}").replace(tzinfo=timezone.utc)
         hora_local = hora_utc + timedelta(hours=TIMEZONE_OFFSET)
 
-        titulo = f"{hora_local.strftime('%Hh%M')} 📺 {canal} | {visitante} vs {mandante}"
-
-        # Garante close_date entre 5min e 10 dias (Telegram requirement)
-        agora = datetime.now(timezone.utc)
-        min_close = agora + timedelta(minutes=5)
-        max_close = agora + timedelta(days=10)
-
-        if hora_utc < min_close:
-            close_ts = round(min_close.timestamp())
-        elif hora_utc > max_close:
-            close_ts = round(max_close.timestamp())
+        # Montar título
+        if canal and canal != "TBD":
+            titulo = f"{hora_local.strftime('%Hh%M')} 📺 {canal} | {visitante} vs {mandante}"
         else:
-            close_ts = round(hora_utc.timestamp())
+            titulo = f"{hora_local.strftime('%Hh%M')} | {visitante} vs {mandante}"
 
-        # Debug para teste
-        print(f"[ENQUETE] {titulo}")
-        print(f" - agora (UTC): {agora.strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f" - fecha às (UTC): {datetime.fromtimestamp(close_ts).strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f" - fecha às (local): {datetime.fromtimestamp(close_ts) + timedelta(hours=TIMEZONE_OFFSET)}")
-
-        await bot.send_poll(
+        # Criar enquete
+        poll = await bot.send_poll(
             chat_id=GROUP_ID,
             question=titulo,
             options=[visitante, mandante],
             is_anonymous=False,
-            allows_multiple_answers=False,
-            close_date=close_ts
+            allows_multiple_answers=False
         )
 
-# Execução direta
+        # Atualizar banco com message_id da enquete
+        conn = sqlite3.connect(db.db_name)
+        cursor = conn.cursor()
+        cursor.execute('UPDATE jogos SET enquete_message_id = ? WHERE id = ?', (poll.message_id, jogo[0]))
+        conn.commit()
+        conn.close()
+
+        enquetes_info.append({
+            "message_id": poll.message_id,
+            "chat_id": GROUP_ID,
+            "hora_utc": f"{jogo[1]}T{jogo[2]}",
+            "titulo": titulo
+        })
+
+    # Marcar como executado hoje
+    db.marcar_execucao_hoje()
+    print(f"Enquetes criadas para {len(jogos)} jogos.")
+
 if __name__ == "__main__":
     import asyncio
     asyncio.run(postar_apostas_e_enquetes())
