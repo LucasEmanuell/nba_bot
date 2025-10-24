@@ -1,2 +1,5 @@
 .env
 __pycache__/
+limpar.py
+debug_jogos_hj.py
+nba_bot.db
